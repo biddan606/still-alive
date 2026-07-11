@@ -3,9 +3,9 @@ import Phaser from 'phaser';
 const WIDTH = 960;
 const HEIGHT = 540;
 const PLAYER_SPEED = 220;
-const ENEMY_SPEED = 70;
-const ELITE_SPEED = 55;
-const PROJECTILE_SPEED = 420;
+const ENEMY_SPEED = 95;
+const ELITE_SPEED = 75;
+const PROJECTILE_SPEED = 380;
 // 시작은 약하게 — 초반은 도망과 수집이 본업, 성장이 재미를 견인한다.
 const START_FIRE_INTERVAL = 900;
 const START_MAGNET_RADIUS = 60;
@@ -26,11 +26,11 @@ const MERGE_MIN_AGE_MS = 2500;
 const MAX_ELITES = 4;
 // 난이도 디렉터 (ADR 참고: VS 쿼터 + sqrt 곡선 + L4D 피크·밸리)
 const DIRECTOR_TICK_MS = 250;
-const BASE_MIN_DENSITY = 5;
-const DENSITY_GROWTH_SEC = 15; // N초마다 최소 밀도 +1
+const BASE_MIN_DENSITY = 12;
+const DENSITY_GROWTH_SEC = 10; // N초마다 최소 밀도 +1
 const PULSE_INTERVAL_MS = 45_000;
 const VALLEY_MS = 10_000;
-const SPEED_GROWTH = 0.0015; // 초당 적 속도 증가율 (선형, 상한 1.6배)
+const SPEED_GROWTH = 0.002; // 초당 적 속도 증가율 (선형, 상한 1.6배)
 
 type Enemy = Phaser.Types.Physics.Arcade.ImageWithDynamicBody & {
   hp?: number;
@@ -389,7 +389,7 @@ class PrototypeScene extends Phaser.Scene {
   }
 
   private xpNeed(): number {
-    return 5 + (this.level - 1) * 3;
+    return 8 + (this.level - 1) * 4;
   }
 
   private gainXp(amount: number) {
@@ -551,7 +551,7 @@ class PrototypeScene extends Phaser.Scene {
     }
 
     // 쿼터 충족 중에도 보조 압박: 간격은 시간에 따라 선형 단축.
-    const interval = Math.max(250, 800 - t * 1.5);
+    const interval = Math.max(200, 600 - t * 1.5);
     if (now - this.lastExtraSpawn >= interval) {
       this.spawnEnemy();
       this.lastExtraSpawn = now;
