@@ -19,6 +19,13 @@ const DASH_DURATION_MS = 160;
 const DASH_IFRAME_MS = 350;
 const MERGE_MIN_AGE_MS = 2500;
 const MAX_ELITES = 4;
+// 난이도 디렉터 (ADR 참고: VS 쿼터 + sqrt 곡선 + L4D 피크·밸리)
+const DIRECTOR_TICK_MS = 250;
+const BASE_MIN_DENSITY = 5;
+const DENSITY_GROWTH_SEC = 15; // N초마다 최소 밀도 +1
+const PULSE_INTERVAL_MS = 45_000;
+const VALLEY_MS = 10_000;
+const SPEED_GROWTH = 0.0015; // 초당 적 속도 증가율 (선형, 상한 1.6배)
 
 type Enemy = Phaser.Types.Physics.Arcade.ImageWithDynamicBody & {
   hp?: number;
@@ -50,6 +57,10 @@ class PrototypeScene extends Phaser.Scene {
   private dashUntil = 0;
   private invincibleUntil = 0;
   private dead = false;
+  private runStart = 0;
+  private lastExtraSpawn = 0;
+  private nextPulseAt = 0;
+  private valleyUntil = 0;
 
   create() {
     this.dead = false;
@@ -74,7 +85,11 @@ class PrototypeScene extends Phaser.Scene {
     this.enemies = this.physics.add.group();
     this.projectiles = this.physics.add.group();
 
-    this.time.addEvent({ delay: 800, loop: true, callback: () => this.spawnEnemy() });
+    this.runStart = this.time.now;
+    this.lastExtraSpawn = this.runStart;
+    this.nextPulseAt = this.runStart + PULSE_INTERVAL_MS;
+    this.valleyUntil = 0;
+    this.time.addEvent({ delay: DIRECTOR_TICK_MS, loop: true, callback: () => this.directorTick() });
     this.time.addEvent({ delay: FIRE_INTERVAL, loop: true, callback: () => this.fire() });
 
     this.physics.add.overlap(this.player, this.enemies, () => this.onPlayerHit());
@@ -207,11 +222,12 @@ class PrototypeScene extends Phaser.Scene {
       this.gauge = Math.min(GAUGE_MAX, this.gauge + deltaMs / GAUGE_CHARGE_MS);
     }
 
+    const speedMul = Math.min(1.6, 1 + this.elapsedSec() * SPEED_GROWTH);
     this.enemies.getChildren().forEach((obj) => {
       const enemy = obj as Enemy;
       const aim = new Phaser.Math.Vector2(this.player.x - enemy.x, this.player.y - enemy.y)
         .normalize()
-        .scale(enemy.elite ? ELITE_SPEED : ENEMY_SPEED);
+        .scale((enemy.elite ? ELITE_SPEED : ENEMY_SPEED) * speedMul);
       enemy.setVelocity(aim.x, aim.y);
     });
 
@@ -221,8 +237,11 @@ class PrototypeScene extends Phaser.Scene {
     });
 
     this.dim.setAlpha((1 - this.worldSpeed) * 0.45);
+    const t = Math.floor(this.elapsedSec());
+    const clock = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
     this.hud.setText(
-      `점수 ${this.score}` + (this.combo > 0 ? `   콤보 x${(1 + this.combo * 0.1).toFixed(1)}` : ''),
+      `${clock}   점수 ${this.score}` +
+        (this.combo > 0 ? `   콤보 x${(1 + this.combo * 0.1).toFixed(1)}` : ''),
     );
     this.comboBar.width = this.combo > 0 ? 120 * (this.comboTimeLeft / COMBO_WINDOW_MS) : 0;
     this.gaugePips.forEach((pip, i) => {
@@ -310,11 +329,60 @@ class PrototypeScene extends Phaser.Scene {
     this.input.keyboard!.once('keydown-SPACE', () => this.scene.restart());
   }
 
-  private spawnEnemy() {
+  // 게임 시간 기준 경과 초 — 불릿타임은 난이도 시계도 늦춘다 (시간=자원 정체성).
+  private elapsedSec(): number {
+    return (this.time.now - this.runStart) / 1000;
+  }
+
+  private minDensity(): number {
+    return BASE_MIN_DENSITY + Math.floor(this.elapsedSec() / DENSITY_GROWTH_SEC);
+  }
+
+  private directorTick() {
     if (this.dead) return;
+    const now = this.time.now;
+    const t = this.elapsedSec();
+
+    // 밸리: 펄스 직후 숨돌림 — 쿼터 충전도 멈춘다.
+    if (now < this.valleyUntil) return;
+
+    // 피크: 주기적 웨이브 펄스 — 최소 밀도의 60%를 링으로 한꺼번에.
+    if (now >= this.nextPulseAt) {
+      const burst = Math.ceil(this.minDensity() * 0.6);
+      for (let i = 0; i < burst; i++) {
+        const angle = (Math.PI * 2 * i) / burst;
+        this.spawnEnemyAt(WIDTH / 2 + Math.cos(angle) * 620, HEIGHT / 2 + Math.sin(angle) * 620);
+      }
+      this.valleyUntil = now + VALLEY_MS;
+      this.nextPulseAt = now + PULSE_INTERVAL_MS;
+      return;
+    }
+
+    // 최소 밀도 쿼터: 미달이면 즉시 채움 (틱당 8마리 상한 — 프레임 히치 방지).
+    const alive = this.enemies.countActive(true);
+    const deficit = this.minDensity() - alive;
+    if (deficit > 0) {
+      for (let i = 0; i < Math.min(deficit, 8); i++) this.spawnEnemy();
+      return;
+    }
+
+    // 쿼터 충족 중에도 보조 압박: 간격은 시간에 따라 선형 단축.
+    const interval = Math.max(250, 800 - t * 1.5);
+    if (now - this.lastExtraSpawn >= interval) {
+      this.spawnEnemy();
+      this.lastExtraSpawn = now;
+    }
+  }
+
+  private spawnEnemy() {
     const edge = Phaser.Math.Between(0, 3);
     const x = edge === 0 ? -20 : edge === 1 ? WIDTH + 20 : Phaser.Math.Between(0, WIDTH);
     const y = edge === 2 ? -20 : edge === 3 ? HEIGHT + 20 : Phaser.Math.Between(0, HEIGHT);
+    this.spawnEnemyAt(x, y);
+  }
+
+  private spawnEnemyAt(x: number, y: number) {
+    if (this.dead) return;
     const enemy = this.physics.add.image(x, y, 'enemy') as Enemy;
     enemy.hp = 1;
     enemy.bornAt = this.time.now;
