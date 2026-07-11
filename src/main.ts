@@ -278,6 +278,31 @@ class PrototypeScene extends Phaser.Scene {
     this.bulletKey = kb.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
     kb.addKey(Phaser.Input.Keyboard.KeyCodes.R).on('down', () => this.scene.restart());
     kb.addKey(Phaser.Input.Keyboard.KeyCodes.ESC).on('down', () => this.togglePause());
+
+    // 첫 런 한정 도구 가이드 — 재시작 루프를 방해하지 않게 registry로 1회만.
+    if (!this.registry.get('guideSeen')) {
+      this.registry.set('guideSeen', true);
+      const guide = this.add
+        .container(0, 0, [
+          this.add.rectangle(WIDTH / 2, 170, 560, 130, 0x05060a, 0.82).setStrokeStyle(1, 0x4fc3f7),
+          this.add
+            .text(
+              WIDTH / 2,
+              170,
+              '스페이스 — 대시: 무적으로 적 벽을 뚫는다\nShift 홀드 — 불릿타임: 세상만 느려지고 나는 그대로\n멈춰 서면 파란 집중 게이지가 차오른다 (둘의 연료)',
+              { fontSize: '17px', color: '#e8e8f0', align: 'center', lineSpacing: 10 },
+            )
+            .setOrigin(0.5),
+        ])
+        .setDepth(25);
+      this.tweens.add({
+        targets: guide,
+        alpha: 0,
+        delay: 5000,
+        duration: 700,
+        onComplete: () => guide.destroy(),
+      });
+    }
   }
 
   private togglePause() {
@@ -293,6 +318,8 @@ class PrototypeScene extends Phaser.Scene {
     }
   }
 
+  private gaugeLabel?: Phaser.GameObjects.Text;
+
   private buildGaugePips() {
     this.gaugePips.forEach((p) => p.destroy());
     this.gaugePips = [];
@@ -304,6 +331,14 @@ class PrototypeScene extends Phaser.Scene {
           .setDepth(11),
       );
     }
+    this.gaugeLabel?.destroy();
+    this.gaugeLabel = this.add
+      .text(12 + this.gaugeMax * 26 + 6, HEIGHT - 18, '집중 — 스페이스 대시 · Shift 불릿타임', {
+        fontSize: '12px',
+        color: '#9aa0b0',
+      })
+      .setOrigin(0, 0.5)
+      .setDepth(11);
   }
 
   update(_time: number, deltaMs: number) {
@@ -323,6 +358,15 @@ class PrototypeScene extends Phaser.Scene {
       this.gauge -= 1;
       this.dashUntil = now + DASH_DURATION_MS;
       this.invincibleUntil = now + DASH_IFRAME_MS;
+      this.cameras.main.shake(90, 0.004);
+    }
+    // 대시 잔상 — "발동했다"를 몸으로 보여준다.
+    if (dashing) {
+      const ghost = this.add
+        .image(this.player.x, this.player.y, 'player')
+        .setAlpha(0.35)
+        .setDepth(this.player.depth - 1);
+      this.tweens.add({ targets: ghost, alpha: 0, duration: 250, onComplete: () => ghost.destroy() });
     }
 
     // 세상은 항상 정상 속도. 슬로우모는 Shift 홀드로 게이지를 태울 때만 (ADR-0003).
@@ -442,7 +486,11 @@ class PrototypeScene extends Phaser.Scene {
       if (p.x < -30 || p.x > WIDTH + 30 || p.y < -30 || p.y > HEIGHT + 30) p.destroy();
     });
 
+    // 불릿타임 연출: 어두워짐 + 플레이어 청색 발광 + 살짝 줌 — "내 시간"임을 보여준다.
     this.dim.setAlpha((1 - this.worldSpeed) * 0.45);
+    this.cameras.main.setZoom(1 + (1 - this.worldSpeed) * 0.06);
+    if (bulletActive) this.player.setTint(0x7fd8ff);
+    else this.player.clearTint();
     const t = Math.floor(this.elapsedSec());
     const clock = `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
     this.hud.setText(
