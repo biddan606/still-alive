@@ -35,7 +35,20 @@ const PULSE_INTERVAL_MS = 45_000;
 const VALLEY_MS = 10_000;
 const SPEED_GROWTH = 0.002; // 초당 적 속도 증가율 (선형, 상한 1.6배)
 
-type EnemyKind = 'chaser' | 'inter' | 'tank' | 'charger';
+type EnemyKind = 'chaser' | 'inter' | 'tank' | 'charger' | 'slime';
+
+// 슬라임: 같은 단계끼리 서로를 찾아가 합체. 소(1)→중(2합체)→대(4합체 상당).
+// 대형은 원거리 탄막 — 합체 방치의 대가가 탄막 유닛이다.
+const SLIME_STAGES = [
+  { tex: 'slime1', hp: 1, speed: 85, score: 12, gems: 1 },
+  { tex: 'slime2', hp: 3, speed: 115, score: 25, gems: 2 },
+  { tex: 'slime3', hp: 8, speed: 50, score: 60, gems: 4 },
+];
+const SLIME_SEEK_RADIUS = 150;
+const SLIME_MERGE_DIST = [22, 30];
+const MAX_LARGE_SLIMES = 2;
+const SLIME_VOLLEY_MS = 3000;
+const SLIME_BULLET_SPEED = 140;
 
 const KIND_STATS: Record<
   EnemyKind,
@@ -45,6 +58,7 @@ const KIND_STATS: Record<
   inter: { tex: 'inter', hp: 1, speed: 105, score: 15, gems: 1 },
   tank: { tex: 'tank', hp: 3, speed: 55, score: 20, gems: 2 },
   charger: { tex: 'charger', hp: 2, speed: 80, score: 20, gems: 2 },
+  slime: { tex: 'slime1', hp: 1, speed: 85, score: 12, gems: 1 },
 };
 
 type Enemy = Phaser.Types.Physics.Arcade.ImageWithDynamicBody & {
@@ -53,6 +67,8 @@ type Enemy = Phaser.Types.Physics.Arcade.ImageWithDynamicBody & {
   mode?: 'seek' | 'windup' | 'charge';
   modeUntil?: number;
   chargeDir?: Phaser.Math.Vector2;
+  stage?: number; // 슬라임 전용: 1(소) 2(중) 3(대)
+  nextShotAt?: number; // 슬라임 대형 전용
 };
 
 // 보스: 5분 도달 시 등장, 처치하면 클리어.
@@ -123,6 +139,9 @@ class Synth {
   }
   levelup() {
     this.beep('triangle', 440, 880, 0.25, 0.15);
+  }
+  merge() {
+    this.beep('sine', 150, 450, 0.2, 0.12);
   }
   death() {
     this.beep('sawtooth', 400, 40, 0.6, 0.22);
@@ -276,6 +295,10 @@ class PrototypeScene extends Phaser.Scene {
     g.clear().fillStyle(0xf5a623).fillTriangle(8, 0, 16, 16, 0, 16).generateTexture('inter', 16, 16);
     g.clear().fillStyle(0x7a3b2e).fillCircle(11, 11, 11).generateTexture('tank', 22, 22);
     g.clear().fillStyle(0x9b59b6).fillRect(0, 0, 16, 16).generateTexture('charger', 16, 16);
+    g.clear().fillStyle(0x3dd6c3).fillCircle(7, 7, 7).generateTexture('slime1', 14, 14);
+    g.clear().fillStyle(0x2bb5a4).fillCircle(11, 11, 11).generateTexture('slime2', 22, 22);
+    g.clear().fillStyle(0x1e8f82).fillCircle(16, 16, 16).generateTexture('slime3', 32, 32);
+    g.clear().fillStyle(0x7fe8d9).fillCircle(5, 5, 5).generateTexture('slimeBullet', 10, 10);
     g.clear().fillStyle(0x5a1210).fillCircle(24, 24, 24).generateTexture('boss', 48, 48);
     g.clear().fillStyle(0xc44fea).fillCircle(5, 5, 5).generateTexture('bossBullet', 10, 10);
     g.clear().fillStyle(0xfff2c0).fillRect(0, 0, 4, 4).generateTexture('spark', 4, 4);
@@ -536,6 +559,23 @@ class PrototypeScene extends Phaser.Scene {
     // 플레이어 실제 화면 속도 (물리 역보정 되돌림) — 예측자 리드 조준용.
     const realVelX = this.player.body.velocity.x * this.worldSpeed;
     const realVelY = this.player.body.velocity.y * this.worldSpeed;
+
+    // 슬라임 합체 판정: 같은 단계끼리 접촉하면 다음 단계로.
+    const slimes = this.enemies.getChildren().filter((o) => (o as Enemy).kind === 'slime') as Enemy[];
+    for (let i = 0; i < slimes.length; i++) {
+      const a = slimes[i];
+      const stageA = a.stage ?? 1;
+      if (!a.active || stageA >= 3) continue;
+      for (let j = i + 1; j < slimes.length; j++) {
+        const b = slimes[j];
+        if (!b.active || (b.stage ?? 1) !== stageA) continue;
+        if (Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y) > SLIME_MERGE_DIST[stageA - 1]) continue;
+        if (stageA === 2 && slimes.filter((s) => s.active && s.stage === 3).length >= MAX_LARGE_SLIMES)
+          continue;
+        this.mergeSlimes(a, b);
+        break;
+      }
+    }
     this.enemies.getChildren().forEach((obj) => {
       const enemy = obj as Enemy;
       const seek = (tx: number, ty: number, spd: number) => {
@@ -552,6 +592,49 @@ class PrototypeScene extends Phaser.Scene {
             spd,
           );
           break;
+        case 'slime': {
+          const stage = enemy.stage ?? 1;
+          const sStats = SLIME_STAGES[stage - 1];
+          const sSpd = sStats.speed * speedMul;
+          if (stage === 3) {
+            // 대형: 느린 추적 + 주기적 4방향 탄. 합체 방치의 대가.
+            seek(this.player.x, this.player.y, sSpd);
+            if (now >= (enemy.nextShotAt ?? 0)) {
+              enemy.nextShotAt = now + SLIME_VOLLEY_MS;
+              const base = Phaser.Math.Angle.Between(enemy.x, enemy.y, this.player.x, this.player.y);
+              for (let k = 0; k < 4; k++) {
+                const angle = base + (Math.PI / 2) * k;
+                const bullet = this.physics.add.image(enemy.x, enemy.y, 'slimeBullet');
+                this.bossBullets.add(bullet);
+                bullet.setVelocity(
+                  Math.cos(angle) * SLIME_BULLET_SPEED,
+                  Math.sin(angle) * SLIME_BULLET_SPEED,
+                );
+              }
+            }
+            break;
+          }
+          // 소·중형: 근처 같은 단계 동족이 있으면 그쪽으로 (합체 시도), 없으면 플레이어에게.
+          let mate: Enemy | null = null;
+          let bestMate = SLIME_SEEK_RADIUS;
+          for (const s of slimes) {
+            if (s === enemy || !s.active || (s.stage ?? 1) !== stage) continue;
+            const d = Phaser.Math.Distance.Between(enemy.x, enemy.y, s.x, s.y);
+            if (d < bestMate) {
+              bestMate = d;
+              mate = s;
+            }
+          }
+          if (mate) seek(mate.x, mate.y, sSpd);
+          else if (stage === 2)
+            seek(
+              this.player.x + realVelX * INTERCEPT_LEAD_SEC,
+              this.player.y + realVelY * INTERCEPT_LEAD_SEC,
+              sSpd,
+            );
+          else seek(this.player.x, this.player.y, sSpd);
+          break;
+        }
         case 'charger': {
           if (enemy.mode === 'windup') {
             enemy.setVelocity(0, 0);
@@ -670,14 +753,18 @@ class PrototypeScene extends Phaser.Scene {
     proj.destroy();
     enemy.hp = (enemy.hp ?? 1) - this.damage;
     if (enemy.hp > 0) return;
-    const stats = KIND_STATS[enemy.kind ?? 'chaser'];
+    const stats =
+      enemy.kind === 'slime'
+        ? SLIME_STAGES[(enemy.stage ?? 1) - 1]
+        : KIND_STATS[enemy.kind ?? 'chaser'];
     this.combo += 1;
     this.comboTimeLeft = COMBO_WINDOW_MS;
     this.score += Math.round(stats.score * (1 + this.combo * 0.1));
     this.dropGems(enemy.x, enemy.y, stats.gems);
 
     // 킬 juice: 파편은 전 킬, 히트스톱·셰이크·중타격음은 묵직한 킬만.
-    const heavy = enemy.kind === 'tank' || enemy.kind === 'charger';
+    const heavy =
+      enemy.kind === 'tank' || enemy.kind === 'charger' || (enemy.kind === 'slime' && (enemy.stage ?? 1) >= 2);
     this.sparks.explode(heavy ? 16 : 8, enemy.x, enemy.y);
     if (heavy) {
       this.hitstopMs = 40;
@@ -941,9 +1028,10 @@ class PrototypeScene extends Phaser.Scene {
     const t = this.elapsedSec();
     const roll = Math.random() * 100;
     if (t < 45) return 'chaser';
-    if (t < 90) return roll < 25 ? 'inter' : 'chaser';
-    if (t < 150) return roll < 25 ? 'inter' : roll < 45 ? 'tank' : 'chaser';
-    return roll < 25 ? 'inter' : roll < 40 ? 'tank' : roll < 55 ? 'charger' : 'chaser';
+    if (t < 60) return roll < 25 ? 'inter' : 'chaser';
+    if (t < 90) return roll < 20 ? 'inter' : roll < 35 ? 'slime' : 'chaser';
+    if (t < 150) return roll < 20 ? 'inter' : roll < 35 ? 'slime' : roll < 50 ? 'tank' : 'chaser';
+    return roll < 20 ? 'inter' : roll < 35 ? 'slime' : roll < 48 ? 'tank' : roll < 60 ? 'charger' : 'chaser';
   }
 
   private spawnEnemy() {
@@ -961,7 +1049,29 @@ class PrototypeScene extends Phaser.Scene {
     enemy.kind = kind;
     enemy.hp = stats.hp;
     enemy.mode = 'seek';
+    if (kind === 'slime') enemy.stage = 1;
     this.enemies.add(enemy);
+  }
+
+  private mergeSlimes(a: Enemy, b: Enemy) {
+    const stage = Math.min(3, (a.stage ?? 1) + 1);
+    const x = (a.x + b.x) / 2;
+    const y = (a.y + b.y) / 2;
+    a.destroy();
+    b.destroy();
+    const stats = SLIME_STAGES[stage - 1];
+    const merged = this.physics.add.image(x, y, stats.tex) as Enemy;
+    merged.kind = 'slime';
+    merged.stage = stage;
+    merged.hp = stats.hp;
+    merged.mode = 'seek';
+    merged.nextShotAt = this.time.now + 1200;
+    this.enemies.add(merged);
+    // 합체 연출: 팝 스케일 + 파편 + 저음 — 인과가 보여야 "끊어라" 결정이 성립한다.
+    merged.setScale(0.4);
+    this.tweens.add({ targets: merged, scale: 1, duration: 180, ease: 'Back.easeOut' });
+    this.sparks.explode(10, x, y);
+    this.synth.merge();
   }
 
   private highScore(): number {
