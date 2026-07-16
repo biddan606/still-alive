@@ -223,10 +223,15 @@ const UPGRADE_DEFS: UpgradeDef[] = [
   {
     key: 'gauge',
     name: '집중',
-    blurb: '멈춰 서 있으면 차오르는 파란 게이지 — 대시(스페이스)와 불릿타임(Shift)의 연료.',
+    blurb: '멈춰 서 있으면 차오르는 파란 게이지 — 대시(스페이스)와 불릿타임(Shift)의 연료. 칸이 늘고 충전도 빨라진다.',
     max: 3,
-    apply: (s) => (s.gaugeMax += 1),
-    info: (s) => `게이지 최대 ${s.gaugeMax}칸 → ${s.gaugeMax + 1}칸`,
+    // 용량만 키우면 풀차지 대기시간도 같이 늘어 후반 픽 체감이 죽는다 — 충전 가속 동봉.
+    apply: (s) => {
+      s.gaugeMax += 1;
+      s.gaugeChargeMs *= 0.9;
+    },
+    info: (s) =>
+      `최대 ${s.gaugeMax}칸 → ${s.gaugeMax + 1}칸 · 충전 ${(s.gaugeChargeMs / 1000).toFixed(2)}초/칸 → ${((s.gaugeChargeMs * 0.9) / 1000).toFixed(2)}초/칸`,
   },
   {
     key: 'magnet',
@@ -392,6 +397,7 @@ class PrototypeScene extends Phaser.Scene {
   damage = 1;
   moveSpeed = PLAYER_SPEED;
   gaugeMax = GAUGE_MAX;
+  gaugeChargeMs = GAUGE_CHARGE_MS;
   magnetRadius = START_MAGNET_RADIUS;
 
   private fireCooldown = 0;
@@ -432,6 +438,7 @@ class PrototypeScene extends Phaser.Scene {
     this.damage = 1;
     this.moveSpeed = PLAYER_SPEED;
     this.gaugeMax = GAUGE_MAX;
+    this.gaugeChargeMs = GAUGE_CHARGE_MS;
     this.magnetRadius = START_MAGNET_RADIUS;
     this.fireCooldown = this.fireInterval;
     this.level = 1;
@@ -734,7 +741,7 @@ class PrototypeScene extends Phaser.Scene {
     // 공짜 슬로우모를 만드는 루프의 차단.
     const standing = dir.lengthSq() === 0 && !dashing && !this.bulletKey.isDown;
     if (standing && this.gauge < this.gaugeMax) {
-      this.gauge = Math.min(this.gaugeMax, this.gauge + deltaMs / GAUGE_CHARGE_MS);
+      this.gauge = Math.min(this.gaugeMax, this.gauge + deltaMs / this.gaugeChargeMs);
     }
 
     const speedMul = Math.min(1.6, 1 + this.elapsedSec() * SPEED_GROWTH);
