@@ -20,13 +20,20 @@ const MAX_GEMS = 200;
 // 불릿타임 중 세상 배율. 0이면 물리 엔진 나눗셈이 터진다.
 const BULLET_TIME_SCALE = 0.2;
 // 불릿타임 유지 비용: 게이지 1칸이 버티는 시간.
-const BULLET_DRAIN_MS = 1500;
+const BULLET_DRAIN_MS = 800;
+// 불릿타임 발동세: 시작할 때 1칸 선불. 그 값어치(0.8초)는 선불 시간으로 즉시 확보되므로
+// 끝까지 쓰면 손해가 없고, 찔끔 쓰고 끊으면 남은 선불을 버린다 — 짧은 남용만 비싸진다.
+// 전량 커밋(궁극기) 정체성 + 게이지 0 근처 재점화 익스플로잇 차단을 겸한다.
+const BULLET_ACTIVATION_COST = 1;
 // 콤보는 실시간으로 식는다 — 시간을 멈춰도 보존되지 않는 게 핵심 규칙.
 const COMBO_WINDOW_MS = 2500;
 const GAUGE_MAX = 3;
 const GAUGE_CHARGE_MS = 1200;
 const DASH_DURATION_MS = 160;
-const DASH_IFRAME_MS = 350;
+const DASH_IFRAME_MS = 300;
+// 대시는 반 칸짜리 기본기 — 자주 쓰게 하되, 락아웃으로 무적 체인 탱킹은 막는다.
+const DASH_COST = 0.5;
+const DASH_LOCKOUT_MS = 400;
 // 난이도 디렉터 (ADR 참고: VS 쿼터 + sqrt 곡선 + L4D 피크·밸리)
 const DIRECTOR_TICK_MS = 250;
 const BASE_MIN_DENSITY = 12;
@@ -357,6 +364,12 @@ class PrototypeScene extends Phaser.Scene {
   private gaugePips: Phaser.GameObjects.Rectangle[] = [];
 
   private worldSpeed = 1;
+  // 세계 시간: worldSpeed로 스케일해 누적. 적 타이머·난이도 시계의 기준.
+  // Phaser의 time.now는 timeScale을 무시하는 실시간이라 세계 시간은 직접 굴려야 한다.
+  // 플레이어 쪽(대시·무적)과 콤보는 실시간 유지.
+  private gameNow = 0;
+  private bulletEngaged = false;
+  private bulletPrepaidUntil = 0;
   private lastDir = new Phaser.Math.Vector2(0, -1);
   private score = 0;
   private combo = 0;
@@ -365,7 +378,6 @@ class PrototypeScene extends Phaser.Scene {
   private dashUntil = 0;
   private invincibleUntil = 0;
   private dead = false;
-  private runStart = 0;
   private lastExtraSpawn = 0;
   private nextPulseAt = 0;
   private valleyUntil = 0;
@@ -405,6 +417,9 @@ class PrototypeScene extends Phaser.Scene {
     this.physics.resume();
     this.levelKeys = [];
     this.worldSpeed = 1;
+    this.gameNow = 0;
+    this.bulletEngaged = false;
+    this.bulletPrepaidUntil = 0;
     this.score = 0;
     this.combo = 0;
     this.comboTimeLeft = 0;
@@ -458,9 +473,8 @@ class PrototypeScene extends Phaser.Scene {
 
     this.physics.add.overlap(this.player, this.bossBullets, () => this.onPlayerHit());
 
-    this.runStart = this.time.now;
-    this.lastExtraSpawn = this.runStart;
-    this.nextPulseAt = this.runStart + PULSE_INTERVAL_MS;
+    this.lastExtraSpawn = 0;
+    this.nextPulseAt = PULSE_INTERVAL_MS;
     this.valleyUntil = 0;
     this.time.addEvent({ delay: DIRECTOR_TICK_MS, loop: true, callback: () => this.directorTick() });
 
@@ -538,7 +552,7 @@ class PrototypeScene extends Phaser.Scene {
             .text(
               WIDTH / 2,
               170,
-              '스페이스 — 대시: 무적으로 적 벽을 뚫는다\nShift 홀드 — 불릿타임: 세상만 느려지고 나는 그대로\n멈춰 서면 파란 집중 게이지가 차오른다 (둘의 연료)',
+              '스페이스 — 대시(반 칸): 무적으로 적 벽을 뚫는다\nShift 홀드 — 불릿타임(시작 1칸 + 유지): 세상만 느려지고 나는 그대로\n멈춰 서면 파란 집중 게이지가 차오른다 (둘의 연료)',
               { fontSize: '17px', color: '#e8e8f0', align: 'center', lineSpacing: 10 },
             )
             .setOrigin(0.5)
@@ -613,8 +627,12 @@ class PrototypeScene extends Phaser.Scene {
     if (dir.lengthSq() > 0) this.lastDir.copy(dir);
 
     const dashing = now < this.dashUntil;
-    if (Phaser.Input.Keyboard.JustDown(this.dashKey) && this.gauge >= 1 && !dashing) {
-      this.gauge -= 1;
+    if (
+      Phaser.Input.Keyboard.JustDown(this.dashKey) &&
+      this.gauge >= DASH_COST &&
+      now >= this.dashUntil + DASH_LOCKOUT_MS
+    ) {
+      this.gauge -= DASH_COST;
       this.dashUntil = now + DASH_DURATION_MS;
       this.invincibleUntil = now + DASH_IFRAME_MS;
       this.cameras.main.shake(90, 0.004);
@@ -633,8 +651,20 @@ class PrototypeScene extends Phaser.Scene {
     }
 
     // 세상은 항상 정상 속도. 슬로우모는 Shift 홀드로 게이지를 태울 때만 (ADR-0003).
-    const bulletActive = this.bulletKey.isDown && this.gauge > 0;
-    if (bulletActive) this.gauge = Math.max(0, this.gauge - deltaMs / BULLET_DRAIN_MS);
+    // 발동세 1칸 선불 → 0.8초 선불 시간 확보, 이후 잔여 게이지를 이어서 태운다.
+    if (
+      !this.bulletEngaged &&
+      Phaser.Input.Keyboard.JustDown(this.bulletKey) &&
+      this.gauge >= BULLET_ACTIVATION_COST
+    ) {
+      this.gauge -= BULLET_ACTIVATION_COST;
+      this.bulletPrepaidUntil = now + BULLET_DRAIN_MS;
+      this.bulletEngaged = true;
+    }
+    const prepaid = now < this.bulletPrepaidUntil;
+    if (!this.bulletKey.isDown || (this.gauge <= 0 && !prepaid)) this.bulletEngaged = false;
+    const bulletActive = this.bulletEngaged;
+    if (bulletActive && !prepaid) this.gauge = Math.max(0, this.gauge - deltaMs / BULLET_DRAIN_MS);
     const target = bulletActive ? BULLET_TIME_SCALE : 1;
     const lerp = 1 - Math.exp(-10 * (deltaMs / 1000));
     this.worldSpeed = Phaser.Math.Linear(this.worldSpeed, target, lerp);
@@ -642,6 +672,7 @@ class PrototypeScene extends Phaser.Scene {
     // Arcade 물리는 timeScale이 클수록 느려지고, Clock은 작을수록 느려진다 — 서로 반대.
     this.physics.world.timeScale = 1 / this.worldSpeed;
     this.time.timeScale = this.worldSpeed;
+    this.gameNow += deltaMs * this.worldSpeed;
 
     // 플레이어는 실시간 속도 유지: 물리 감속을 역보정해서 슬로우모 속 우위를 만든다.
     const speed = (dashing ? this.moveSpeed * 3.2 : this.moveSpeed) / this.worldSpeed;
@@ -687,7 +718,9 @@ class PrototypeScene extends Phaser.Scene {
       if (this.comboTimeLeft <= 0) this.combo = 0;
     }
     // 충전은 완전히 멈춰 서 있을 때만 — 세상이 정상 속도로 다가오는 동안의 투자다.
-    const standing = dir.lengthSq() === 0 && !dashing && !bulletActive;
+    // Shift를 누른 채로는 금지: 게이지 0에서 홀드 시 충전/방전이 프레임 교대로 일어나
+    // 공짜 슬로우모를 만드는 루프의 차단.
+    const standing = dir.lengthSq() === 0 && !dashing && !this.bulletKey.isDown;
     if (standing && this.gauge < this.gaugeMax) {
       this.gauge = Math.min(this.gaugeMax, this.gauge + deltaMs / GAUGE_CHARGE_MS);
     }
@@ -721,8 +754,9 @@ class PrototypeScene extends Phaser.Scene {
         if (Math.abs(aim.x) > 1) enemy.setFlipX(aim.x < 0);
       };
       const stats = KIND_STATS[enemy.kind ?? 'chaser'];
-      // 격노: 나이가 임계를 넘으면 가속 + 붉은 틴트. 되돌아가지 않는다.
-      const enrageMul = now - (enemy.spawnedAt ?? now) >= ENRAGE_MS ? ENRAGE_SPEED_MUL : 1;
+      // 격노: 나이가 임계를 넘으면 가속 + 붉은 틴트. 되돌아가지 않는다. 나이는 세계 시간 기준.
+      const enrageMul =
+        this.gameNow - (enemy.spawnedAt ?? this.gameNow) >= ENRAGE_MS ? ENRAGE_SPEED_MUL : 1;
       if (enrageMul > 1) enemy.setTint(ENRAGE_TINT);
       const spd = stats.speed * speedMul * enrageMul;
       switch (enemy.kind) {
@@ -740,8 +774,8 @@ class PrototypeScene extends Phaser.Scene {
           if (stage === 3) {
             // 대형: 느린 추적 + 주기적 4방향 탄. 합체 방치의 대가.
             seek(this.player.x, this.player.y, sSpd);
-            if (now >= (enemy.nextShotAt ?? 0)) {
-              enemy.nextShotAt = now + SLIME_VOLLEY_MS;
+            if (this.gameNow >= (enemy.nextShotAt ?? 0)) {
+              enemy.nextShotAt = this.gameNow + SLIME_VOLLEY_MS;
               const base = Phaser.Math.Angle.Between(enemy.x, enemy.y, this.player.x, this.player.y);
               for (let k = 0; k < 4; k++) {
                 const angle = base + (Math.PI / 2) * k;
@@ -782,10 +816,11 @@ class PrototypeScene extends Phaser.Scene {
         case 'charger': {
           if (enemy.mode === 'windup') {
             enemy.setVelocity(0, 0);
-            enemy.setAlpha(0.4 + 0.6 * Math.abs(Math.sin(now / 60)));
-            if (now >= (enemy.modeUntil ?? 0)) {
+            // 경고 점멸도 세계 시간 — 불릿타임 중엔 점멸·전환 모두 함께 늦어진다.
+            enemy.setAlpha(0.4 + 0.6 * Math.abs(Math.sin(this.gameNow / 60)));
+            if (this.gameNow >= (enemy.modeUntil ?? 0)) {
               enemy.mode = 'charge';
-              enemy.modeUntil = now + CHARGER_CHARGE_MS;
+              enemy.modeUntil = this.gameNow + CHARGER_CHARGE_MS;
               enemy.chargeDir = new Phaser.Math.Vector2(
                 this.player.x - enemy.x,
                 this.player.y - enemy.y,
@@ -798,13 +833,13 @@ class PrototypeScene extends Phaser.Scene {
               d.x * CHARGER_CHARGE_SPEED * speedMul * enrageMul,
               d.y * CHARGER_CHARGE_SPEED * speedMul * enrageMul,
             );
-            if (now >= (enemy.modeUntil ?? 0)) enemy.mode = 'seek';
+            if (this.gameNow >= (enemy.modeUntil ?? 0)) enemy.mode = 'seek';
           } else {
             seek(this.player.x, this.player.y, spd);
             const dist = Phaser.Math.Distance.Between(enemy.x, enemy.y, this.player.x, this.player.y);
             if (dist < CHARGER_RANGE) {
               enemy.mode = 'windup';
-              enemy.modeUntil = now + CHARGER_WINDUP_MS;
+              enemy.modeUntil = this.gameNow + CHARGER_WINDUP_MS;
             }
           }
           break;
@@ -835,8 +870,8 @@ class PrototypeScene extends Phaser.Scene {
         .scale(BOSS_SPEED);
       b.setVelocity(aim.x, aim.y);
       if (Math.abs(aim.x) > 1) b.setFlipX(aim.x < 0);
-      if (now >= this.bossNextVolley) {
-        this.bossNextVolley = now + BOSS_VOLLEY_MS;
+      if (this.gameNow >= this.bossNextVolley) {
+        this.bossNextVolley = this.gameNow + BOSS_VOLLEY_MS;
         for (let i = 0; i < 10; i++) {
           const angle = (Math.PI * 2 * i) / 10;
           const bullet = this.physics.add.image(b.x, b.y, 'bossBullet');
@@ -1060,7 +1095,7 @@ class PrototypeScene extends Phaser.Scene {
     boss.setDepth(1);
     boss.hp = BOSS_HP;
     this.boss = boss;
-    this.bossNextVolley = this.time.now + 1500;
+    this.bossNextVolley = this.gameNow + 1500;
     this.bossBar = this.add.rectangle(0, 0, 60, 5, 0xe4573d).setOrigin(0, 0.5).setDepth(12);
     // Phaser는 group vs sprite 콜백 인자 순서가 뒤집힐 수 있어 boss가 아닌 쪽을 투사체로 판별.
     this.physics.add.overlap(this.projectiles, boss, (a, b) => {
@@ -1131,9 +1166,9 @@ class PrototypeScene extends Phaser.Scene {
     this.input.keyboard!.once('keydown-ESC', () => this.scene.start('title'));
   }
 
-  // 게임 시간 기준 경과 초 — 불릿타임은 난이도 시계도 늦춘다 (시간=자원 정체성).
+  // 세계 시간 기준 경과 초 — 불릿타임은 난이도 시계도 늦추고, 일시정지·레벨업 중엔 멈춘다.
   private elapsedSec(): number {
-    return (this.time.now - this.runStart) / 1000;
+    return this.gameNow / 1000;
   }
 
   private minDensity(): number {
@@ -1156,7 +1191,8 @@ class PrototypeScene extends Phaser.Scene {
 
   private directorTick() {
     if (this.dead) return;
-    const now = this.time.now;
+    // 디렉터도 세계 시간으로 산다 — 불릿타임 중엔 펄스·보조 스폰 간격도 늦어진다.
+    const now = this.gameNow;
     const t = this.elapsedSec();
 
     // 밸리: 펄스 직후 숨돌림 — 쿼터 충전도 멈춘다.
@@ -1218,7 +1254,7 @@ class PrototypeScene extends Phaser.Scene {
     enemy.kind = kind;
     enemy.hp = stats.hp;
     enemy.mode = 'seek';
-    enemy.spawnedAt = this.time.now;
+    enemy.spawnedAt = this.gameNow;
     if (kind === 'slime') enemy.stage = 1;
     this.enemies.add(enemy);
   }
@@ -1237,8 +1273,8 @@ class PrototypeScene extends Phaser.Scene {
     merged.stage = stage;
     merged.hp = stats.hp;
     merged.mode = 'seek';
-    merged.spawnedAt = this.time.now; // 합체 = 새 개체, 격노 타이머 리셋
-    merged.nextShotAt = this.time.now + 1200;
+    merged.spawnedAt = this.gameNow; // 합체 = 새 개체, 격노 타이머 리셋
+    merged.nextShotAt = this.gameNow + 1200;
     this.enemies.add(merged);
     // 합체 연출: 팝 스케일 + 파편 + 저음 — 인과가 보여야 "끊어라" 결정이 성립한다.
     merged.setScale(stats.scale * 0.4);
@@ -1252,7 +1288,8 @@ class PrototypeScene extends Phaser.Scene {
   }
 }
 
-new Phaser.Game({
+// 디버그·자동 테스트에서 씬 상태를 들여다보기 위한 노출.
+(window as unknown as { game: Phaser.Game }).game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
   width: WIDTH,
